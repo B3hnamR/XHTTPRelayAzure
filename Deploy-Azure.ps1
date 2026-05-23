@@ -62,10 +62,23 @@ trap {
 
 function Write-DebugLog([string]$Text) {
   if ([string]::IsNullOrWhiteSpace($script:DebugLogPath)) { return }
-  $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Text
+  $safeText = Redact-DebugText -Text $Text
+  $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $safeText
   try {
     Add-Content -LiteralPath $script:DebugLogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
   } catch {}
+}
+
+function Redact-DebugText([string]$Text) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+  $safe = [string]$Text
+  $safe = [regex]::Replace($safe, '(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b', '<email>')
+  $safe = [regex]::Replace($safe, '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '<guid>')
+  $safe = [regex]::Replace($safe, '(?i)(TARGET_DOMAIN=)(\S+)', '$1<redacted>')
+  $safe = [regex]::Replace($safe, '(?i)(RELAY_KEY=)(\S*)', '$1<redacted>')
+  $safe = [regex]::Replace($safe, '(?i)(enter the code\s+)[A-Z0-9]+', '$1<redacted>')
+  $safe = [regex]::Replace($safe, 'C:\\Users\\[^\\\s]+', 'C:\Users\<user>')
+  return $safe
 }
 
 function Read-Default([string]$Prompt, [string]$DefaultValue) {
@@ -237,6 +250,11 @@ function Get-AzureThrottleRetryDelaySeconds([string]$Text, [int]$Attempt) {
   $fallback = @(30, 60, 120)
   $index = [Math]::Min([Math]::Max($Attempt - 1, 0), $fallback.Count - 1)
   return $fallback[$index]
+}
+
+function Test-AzTransientNetworkError([string]$Text) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+  return ($Text -match "(?i)ConnectionResetError|WinError 10054|Connection aborted|ProtocolError|requests\.exceptions\.ConnectionError|RemoteDisconnected|Read timed out|temporarily unavailable|TLS/SSL connection has been closed")
 }
 
 function Get-MsiExitMessage([int]$Code) {
@@ -787,10 +805,12 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
   $azArgs = @($ArgsList)
   if ($azArgs -notcontains "--only-show-errors") { $azArgs += "--only-show-errors" }
   if (($azArgs -notcontains "--output") -and ($azArgs -notcontains "-o")) { $azArgs += @("--output", "none") }
+  $operationText = $azArgs -join " "
+  $isZipDeploy = ($operationText -match "(?i)\bwebapp deploy\b")
 
   $maxAttempts = 4
   for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-    Write-DebugLog ("RUN attempt {0}/{1}: az {2}" -f $attempt, $maxAttempts, ($azArgs -join " "))
+    Write-DebugLog ("RUN attempt {0}/{1}: az {2}" -f $attempt, $maxAttempts, $operationText)
     if (-not [string]::IsNullOrWhiteSpace($Label)) {
       if ($attempt -eq 1) {
         Write-Host ("  ..  {0}" -f $Label) -ForegroundColor DarkCyan
@@ -816,18 +836,25 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
     }
 
     if ($exitCode -eq 0) {
-      Write-DebugLog ("AZ OK: az {0}" -f ($azArgs -join " "))
+      Write-DebugLog ("AZ OK: az {0}" -f $operationText)
       if (-not [string]::IsNullOrWhiteSpace($Label)) {
         Write-StepDone -Label $Label
       }
       return
     }
 
-    Write-DebugLog ("AZ FAILED attempt {0}/{1} exit={2}: az {3}" -f $attempt, $maxAttempts, $exitCode, ($azArgs -join " "))
+    Write-DebugLog ("AZ FAILED attempt {0}/{1} exit={2}: az {3}" -f $attempt, $maxAttempts, $exitCode, $operationText)
     if ($text -match "(?i)throttled|too many requests" -and $attempt -lt $maxAttempts) {
       $delaySeconds = Get-AzureThrottleRetryDelaySeconds -Text $text -Attempt $attempt
       Write-DebugLog ("Azure throttled operation. Waiting {0}s before retry." -f $delaySeconds)
       Write-Host ("  !!  Azure throttled this step. Waiting {0}s before retry {1}/{2}..." -f $delaySeconds, ($attempt + 1), $maxAttempts) -ForegroundColor Yellow
+      Start-Sleep -Seconds $delaySeconds
+      continue
+    }
+    if ($isZipDeploy -and (Test-AzTransientNetworkError -Text $text) -and $attempt -lt $maxAttempts) {
+      $delaySeconds = @(20, 45, 90)[$attempt - 1]
+      Write-DebugLog ("Azure CLI/Kudu connection was reset. Waiting {0}s before retry." -f $delaySeconds)
+      Write-Host ("  !!  Azure deployment connection reset. Waiting {0}s before retry {1}/{2}..." -f $delaySeconds, ($attempt + 1), $maxAttempts) -ForegroundColor Yellow
       Start-Sleep -Seconds $delaySeconds
       continue
     }
@@ -855,6 +882,9 @@ function Invoke-Az([string[]]$ArgsList, [string]$Label = "") {
       }
       if ($text -match "(?i)failed to start within 10 mins|worker proccess failed to start|worker process failed to start|site failed to start") {
         throw ("{0}: Azure deployed the ZIP, but the Node app did not start in time. Check that TARGET_DOMAIN includes https:// or http:// plus the port, inspect the Azure/Kudu log URL in the debug log, and try NODE:20-lts if NODE:22-lts is unsupported in that region." -f $(if ($Label) { $Label } else { "ZIP deployment" }))
+      }
+      if ($isZipDeploy -and (Test-AzTransientNetworkError -Text $text)) {
+        throw ("{0}: Azure CLI lost the deployment connection after several retries. This is usually a temporary Kudu/OneDeploy network reset. Rerun the installer; existing resources will be reused." -f $(if ($Label) { $Label } else { "ZIP deployment" }))
       }
       if (-not [string]::IsNullOrWhiteSpace($errorLine)) { throw ("{0}: {1}" -f $(if ($Label) { $Label } else { "az command failed" }), $errorLine.Trim()) }
       if (-not [string]::IsNullOrWhiteSpace($lastLine)) { throw ("{0}: {1}" -f $(if ($Label) { $Label } else { "az command failed" }), $lastLine) }
